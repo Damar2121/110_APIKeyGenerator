@@ -1,108 +1,130 @@
-// server.js
+// server.js - Final Version
 const express = require('express');
 const bodyParser = require('body-parser');
 const session = require('express-session');
 const bcrypt = require('bcrypt');
 const path = require('path');
-const db = require('./db'); // Pastikan file db.js sudah ada dan benar
+const db = require('./db'); // Pastikan file db.js menggunakan host: '127.0.0.1'
 
 const app = express();
 const PORT = 3000;
 
 // --- MIDDLEWARE ---
+// 1. Parsing Body (agar bisa baca data dari form HTML)
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
-app.use(express.static(path.join(__dirname, 'public'))); // Melayani file HTML dari folder public
 
+// 2. Folder Public (Menyajikan file HTML, CSS, JS)
+app.use(express.static(path.join(__dirname, 'public')));
+
+// 3. Konfigurasi Session (Agar admin tetap login)
 app.use(session({
-    secret: 'kunci_rahasia_admin_123', // Bisa diganti string acak
+    secret: 'rahasia_dapur_server_ini', // Boleh diganti string acak
     resave: false,
     saveUninitialized: false,
-    cookie: { maxAge: 24 * 60 * 60 * 1000 } // Sesi 24 jam
+    cookie: { maxAge: 24 * 60 * 60 * 1000 } // Login berlaku 24 jam
 }));
 
-// Middleware Cek Login Admin
+// --- FUNGSI CEK LOGIN (Proteksi Halaman) ---
 const isAuthenticated = (req, res, next) => {
     if (req.session.adminId) {
-        next();
+        next(); // Lanjut kalau sudah login
     } else {
-        res.status(401).json({ error: 'Unauthorized. Silakan login.' });
+        // Tolak akses jika belum login
+        res.status(401).json({ error: 'Akses ditolak. Silakan login admin.' });
     }
 };
 
-// --- ROUTES ---
+// ================= ROUTES / JALUR APLIKASI =================
 
-// 1. REGISTER USER (Logic Diubah: Menerima API Key dari Frontend)
+// 1. API REGISTER USER (Data dari register_user.html)
 app.post('/api/user/register', async (req, res) => {
-    // Kita ambil 'apiKey' dari body karena sudah digenerate di HTML
+    // Ambil data yang dikirim form
     const { firstName, lastName, email, apiKey } = req.body;
 
-    // Validasi: Pastikan API Key tidak kosong
+    // Cek apakah user sudah klik tombol generate di frontend
     if (!apiKey) {
-        return res.redirect('/index.html?status=error_no_key');
+        return res.redirect('/register_user.html?status=error_no_key');
     }
 
     try {
-        // Langkah A: Simpan API Key ke tabel ApiKey
+        // A. Simpan API Key dulu ke tabel ApiKey
         const [keyResult] = await db.query('INSERT INTO ApiKey (`Key`) VALUES (?)', [apiKey]);
         const newKeyId = keyResult.insertId;
 
-        // Langkah B: Simpan Data User (Hubungkan dengan ID ApiKey tadi)
+        // B. Simpan Data User (nyambung ke ID ApiKey tadi)
         await db.query(
             'INSERT INTO User (First_name, Last_name, Email, ApiKeyID) VALUES (?, ?, ?, ?)', 
             [firstName, lastName, email, newKeyId]
         );
 
-        // Sukses
-        res.redirect('/index.html?status=success');
+        // SUKSES: Balik ke halaman register_user.html
+        res.redirect('/register_user.html?status=success');
 
     } catch (error) {
-        console.error(error);
-        // Kemungkinan error: Email sudah ada atau API Key duplikat (sangat jarang untuk UUID)
-        res.redirect('/index.html?status=error');
+        // ERROR: Tampilkan error di terminal (biar admin tau)
+        console.error("ERROR DATABASE:", error);
+
+        // Kirim pesan error asli ke browser (biar user tau, misal email duplikat)
+        const errorMessage = encodeURIComponent(error.sqlMessage || error.message);
+        res.redirect('/register_user.html?status=error&msg=' + errorMessage);
     }
 });
 
-// 2. REGISTER ADMIN
+// 2. API REGISTER ADMIN
 app.post('/api/admin/register', async (req, res) => {
     const { email, password } = req.body;
+
     try {
+        // Enkripsi password sebelum disimpan
         const hashedPassword = await bcrypt.hash(password, 10);
+        
         await db.query('INSERT INTO Admin (Email, Password) VALUES (?, ?)', [email, hashedPassword]);
+        
+        // Sukses, arahkan ke login
         res.redirect('/admin_login.html?registered=true');
     } catch (error) {
-        res.send("Gagal register. Email mungkin sudah digunakan.");
+        console.error(error);
+        res.send("Gagal register Admin. Email mungkin sudah terdaftar.");
     }
 });
 
-// 3. LOGIN ADMIN
+// 3. API LOGIN ADMIN
 app.post('/api/admin/login', async (req, res) => {
     const { email, password } = req.body;
+
     try {
+        // Cari admin berdasarkan email
         const [admins] = await db.query('SELECT * FROM Admin WHERE Email = ?', [email]);
-        
+
+        // Jika email tidak ada
         if (admins.length === 0) {
             return res.redirect('/admin_login.html?error=notfound');
         }
 
-        const admin = admins[0];
-        const match = await bcrypt.compare(password, admin.Password);
+        const adminData = admins[0];
+
+        // Cek password (bandingkan input dengan hash di DB)
+        const match = await bcrypt.compare(password, adminData.Password);
 
         if (match) {
-            req.session.adminId = admin.ID;
-            res.redirect('/dashboard.html');
+            // Password Benar -> Buat Sesi
+            req.session.adminId = adminData.ID;
+            res.redirect('/dashboard.html'); // Masuk Dashboard
         } else {
+            // Password Salah
             res.redirect('/admin_login.html?error=wrongpass');
         }
     } catch (error) {
         console.error(error);
-        res.send("Server Error");
+        res.send("Terjadi kesalahan server saat login.");
     }
 });
 
-// 4. API DASHBOARD DATA (Protected)
+// 4. API GET DATA DASHBOARD (Hanya bisa diakses jika login)
 app.get('/api/dashboard/data', isAuthenticated, async (req, res) => {
     try {
+        // Query Status: Cek apakah manual revoked ATAU expired (lebih dari 30 hari tidak aktif)
         const query = `
             SELECT 
                 u.ID, u.First_name, u.Last_name, u.Email, 
@@ -116,28 +138,39 @@ app.get('/api/dashboard/data', isAuthenticated, async (req, res) => {
             JOIN ApiKey ak ON u.ApiKeyID = ak.ID
             ORDER BY u.ID DESC
         `;
+        
         const [users] = await db.query(query);
-        res.json(users);
+        res.json(users); // Kirim data JSON ke frontend
+
     } catch (error) {
-        res.status(500).json({ error: "Database Error" });
+        console.error(error);
+        res.status(500).json({ error: "Gagal mengambil data database." });
     }
 });
 
-// 5. DELETE USER (Protected)
+// 5. API DELETE USER (Hanya bisa diakses jika login)
 app.delete('/api/user/delete/:id', isAuthenticated, async (req, res) => {
+    const keyId = req.params.id;
     try {
-        await db.query('DELETE FROM ApiKey WHERE ID = ?', [req.params.id]);
+        // Hapus ApiKey (User otomatis terhapus karena settingan MySQL CASCADE)
+        await db.query('DELETE FROM ApiKey WHERE ID = ?', [keyId]);
         res.json({ success: true });
     } catch (error) {
+        console.error(error);
         res.status(500).json({ success: false });
     }
 });
 
 // 6. LOGOUT
 app.get('/logout', (req, res) => {
-    req.session.destroy(() => res.redirect('/admin_login.html'));
+    req.session.destroy(() => {
+        res.redirect('/admin_login.html'); // Balik ke login admin
+    });
 });
 
+// JALANKAN SERVER
 app.listen(PORT, () => {
-    console.log(`Server berjalan di http://localhost:${PORT}`);
+    console.log(`----------------------------------------------------`);
+    console.log(`Server Berjalan di: http://localhost:${PORT}`);
+    console.log(`----------------------------------------------------`);
 });
